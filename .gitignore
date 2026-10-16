@@ -1,0 +1,10 @@
+# Секреты — не попадают в репозиторий
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
