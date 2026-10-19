@@ -1,5 +1,7 @@
 import openai
 import os
+import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -16,76 +18,91 @@ if not YANDEX_FOLDER_ID:
         raise ValueError("Не найден YANDEX_FOLDER_ID в .env")
 
 SYSTEM_PROMPT = """
-    _Ты — ассистент-ресерчер, который ищет в интернете актуальные материалы и полезные ресурсы._
-    
-    _Ты специализируешься на поиске свежих статей, новостей, исследований и инструментов._
-    
-    _**Правила:**_
-    
-    1. _Всегда сначала используй интернет-поиск._
-    
-    2. _Отдавай приоритет свежим материалам._
-    
-    3. _Отдавай приоритет авторитетным источникам: официальные сайты, научные публикации, GitHub, документация._
-    
-    4. _Не придумывай ссылки — используй только найденные материалы._
-    
-    5. _В ответе всегда давай ровно 5 ссылок._
-    
-    6. _Для каждой ссылки укажи:_
-        
-        - _название материала;_
-        
-        - _URL;_
-        
-        - _1–2 предложения, почему источник полезен._
-
-    7. _Важно: всегда отвечай только на русском языке._
-    
-        - _Даже если источники на английском — переводи заголовки и описания на русский;_
-    
-        - _Не используй английский язык в тексте ответа, кроме оригинальных названий продуктов, компаний и ссылок;_
-    
-        - _Не переключайся на английский ни при каких условиях_    
-    
-    8. _Если прямых материалов мало, расширяй поиск на англоязычные источники, но всё равно дай 5 ссылок._
-    
-    9. _Сначала дай короткий вывод (1–2 предложения), затем список ссылок._
+- Ты — организатор досуга.
+- Предложи ровно 3 разных варианта, как провести вечер, учитывая интересы,
+  место и ограничения из сообщения пользователя. Отвечай на русском языке.
+- Для каждого варианта укажи название и короткий план из 2–3 действий.
+- Не придумывай сведения о пользователе, цены и доступность мероприятий.
+- Не добавляй длинное вступление. Ориентир — до 250 слов.
     """
 
-client = openai.OpenAI(
-    api_key=YANDEX_API_KEY,
-    base_url="https://ai.api.cloud.yandex.net/v1",
-    project= YANDEX_FOLDER_ID
-)
+TEMPERATURE = 0.8
 
-def research(query: str) -> str:    
+DEFAULT_QUERY = "Хочу отдохнуть дома, люблю кино и вкусную еду"
+
+def extract_text(response) -> str:
+    """Извлекает текст и из стандартного ответа SDK, и из content-блоков."""
+    text = getattr(response, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    parts = []
+    for item in getattr(response, "output", None) or []:
+        for content in getattr(item, "content", None) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+def generate_evening(client, model: str, query: str, temperature: float):
     response = client.responses.create(
-        model=f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_MODEL}",
-        instructions = SYSTEM_PROMPT,
+        model=model,
+        instructions=SYSTEM_PROMPT,
         input=query,
-        tools=[
-            {
-                "type": "web_search"
-            }
-        ],
-        temperature=0.2,
-        max_output_tokens=1800
+        temperature=temperature,
+        max_output_tokens=1800,
     )
+    status = getattr(response, "status", None)
+    if status and status != "completed":
+        raise RuntimeError(
+            f"Ответ не завершён: status={status}. "
+            "Проверьте статус запроса и лимит max_output_tokens."
+        )
+    text = extract_text(response)
+    if not text:
+        raise RuntimeError("API не вернул текст ответа.")
+    return text, response
 
-    text_parts = []
+def main() -> int:
+    directory = Path(__file__).resolve().parent
+    load_dotenv(directory / ".env")
+    api_key = os.getenv("YANDEX_API_KEY", "").strip()
+    folder_id = os.getenv("YANDEX_FOLDER_ID", "").strip()
+    if not api_key or not folder_id:
+        print("Укажите YANDEX_API_KEY и YANDEX_FOLDER_ID в .env рядом со скриптом.", file=sys.stderr)
+        return 1
+    model_name = os.getenv("YANDEX_MODEL", "yandexgpt-5-lite").strip()
+    if not model_name:
+        print("YANDEX_MODEL не должен быть пустым.", file=sys.stderr)
+        return 1
+    model = f"gpt://{folder_id}/{model_name}"
+    try:
+        query = input(f"Запрос (Enter — {DEFAULT_QUERY}): ").strip() or DEFAULT_QUERY
+    except (EOFError, KeyboardInterrupt):
+        print("\nВвод отменён.", file=sys.stderr)
+        return 1
 
-    if hasattr(response, "output") and response.output:
-        for item in response.output:
-            if hasattr(item, "content") and item.content:
-                for content_item in item.content:
-                    text = getattr(content_item, "text", None)
-                    if text:
-                        text_parts.append(text)
+    with openai.OpenAI(
+        api_key=api_key,
+        base_url="https://ai.api.cloud.yandex.net/v1",
+        project=folder_id,
+        timeout=60.0,
+        max_retries=0,
+    ) as client:
+        print(f"\nЗапрос к модели: temperature={TEMPERATURE}...")
+        text, _ = generate_evening(client, model, query, TEMPERATURE)
+        print(text)
+    return 0
 
-    return "\n".join(text_parts).strip()
 
 if __name__ == "__main__":
-    user_query = "Найди свежие новости и полезные материалы про AI agents и web search в LLM"
-    result = research(user_query)
-    print(result)
+    try:
+        sys.exit(main())
+    except openai.APIStatusError as exc:
+        print(f"Ошибка API: HTTP {exc.status_code}. Проверьте ключ, права, модель и баланс.", file=sys.stderr)
+        sys.exit(1)
+    except openai.APIConnectionError:
+        print("Не удалось получить ответ API: проверьте соединение и доступность сервиса.", file=sys.stderr)
+        sys.exit(1)
+    except (RuntimeError, OSError) as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        sys.exit(1)
